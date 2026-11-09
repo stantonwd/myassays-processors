@@ -1,0 +1,18 @@
+# Data files: never commit real assay data
+*.xlsx
+*.xls
+*.xlsm
+*.csv
+
+# Python clutter
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Streamlit secrets (for potential future SQL login)
+.streamlit/secrets.toml
+
+# OS/editor files
+.DS_Store
+Thumbs.db
