@@ -3,7 +3,8 @@ import io
 import pandas as pd
 import streamlit as st
 from myassays_parser import (parse_myassays, apply_qc,
-                             apply_control_qc, apply_standard_qc)
+                             apply_control_qc, apply_standard_qc, parse_plate_name, HORMONES,
+                             build_sample_output, build_control_output)
 
 st.set_page_config(page_title="MyAssays Processor", layout="wide")
 st.title("MyAssays hormone assay processor")
@@ -31,6 +32,18 @@ st.subheader(plate.name or "Unnamed plate")
 if plate.notes:
     st.caption(f"Notes in file: {plate.notes}")
 
+# ---- plate identifiers (auto-filled from the plate name; edit if wrong) ----
+guess_h, guess_n, guess_date = parse_plate_name(plate.name)
+i1, i2, i3, i4 = st.columns(4)
+hormone = i1.selectbox("Hormone assayed", HORMONES,
+                       index=HORMONES.index(guess_h) if guess_h in HORMONES else 0)
+plate_number = i2.number_input("Plate number", 1, 9999, guess_n or 1, 1)
+date_assayed = i3.date_input("date_assayed", guess_date)
+control_plate_id = i4.text_input("control_plate_id (inter-assay)", "")
+plate_id = f"{hormone}{plate_number}"
+if guess_h and guess_h != hormone:
+    st.warning(f"The file name says '{plate.name}' but you selected hormone {hormone}.")
+
 # ---- plate-level info ----
 c = st.columns(4)
 c[0].metric("R² (4PL)", f"{plate.fit.get('R²', float('nan')):.4f}")
@@ -44,7 +57,8 @@ c[3].metric("NSB raw", f"{plate.nsb['raw_1'].iloc[0]:.3f} / {plate.nsb['raw_2'].
 st.markdown("### Dilutions")
 st.caption("Enter the dilution factor for each sample (e.g. 128 for 1:128). "
            "Leave at 1 if neat. See the notes line above for what was run.")
-dil_df = pd.DataFrame({"sample": plate.samples["sample"], "dilution": 1.0})
+all_ids = pd.concat([plate.controls["sample"], plate.samples["sample"]], ignore_index=True)
+dil_df = pd.DataFrame({"sample": all_ids, "dilution": 1.0})
 dil_df = st.data_editor(dil_df, hide_index=True, disabled=["sample"], height=250,
                         column_config={"dilution": st.column_config.NumberColumn(
                             "Dilution factor (e.g. 128 for 1:128)", min_value=1)})
@@ -56,7 +70,7 @@ samples = apply_qc(plate.samples, dilutions, cv_limit, b_lo, b_hi)
 
 # ---- results ----
 cols = ["sample", "wells", "pct_b_b0", "conc_1", "conc_2", "conc_avg", "cv_pct",
-        "sd", "sem", "dilution", "final_conc", "status", "flags"]
+        "sd", "sem", "dilution", "status", "flags"]
 def hl(row):
     s = row.get("status", "")
     color = {"FAIL": "#f8c8c8", "REVIEW": "#fff3a3"}.get(s, "")
@@ -83,24 +97,33 @@ with tab3:
 
 # ---- downloads ----
 st.markdown("### Export")
-plate_cols = {"plate": plate.name, "R2": plate.fit.get("R²"), "notes": plate.notes}
-ctrl_out = controls.assign(**plate_cols)
-samp_out = samples.assign(**plate_cols)
+st.caption("conc_1, conc_2 and conc_avg are the raw MyAssays values, not multiplied by dilution. "
+           "Final concentrations are calculated later. flag is blank when a sample is OK.")
+if not date_assayed:
+    st.warning("Fill in date_assayed before exporting.")
+samp_out = build_sample_output(samples, hormone, plate_number, date_assayed)
+ctrl_out = build_control_output(plate.controls, dilutions, hormone, plate_number,
+                                date_assayed, control_plate_id or None)
+with st.expander("Preview export tables"):
+    st.write("Samples file"); st.dataframe(samp_out, hide_index=True)
+    st.write("Controls file"); st.dataframe(ctrl_out, hide_index=True)
 
 buf = io.BytesIO()
 with pd.ExcelWriter(buf, engine="openpyxl") as xw:
     samp_out.to_excel(xw, sheet_name="Samples", index=False)
     ctrl_out.to_excel(xw, sheet_name="Controls", index=False)
-    standards.to_excel(xw, sheet_name="Standards", index=False)
 d1, d2, d3 = st.columns(3)
 d1.download_button("Download results (.xlsx)", buf.getvalue(),
-                   file_name=f"{plate.name or 'plate'}_results.xlsx")
+                   file_name=f"{plate_id}_results.xlsx")
 d2.download_button("Controls table (.csv)", ctrl_out.to_csv(index=False),
-                   file_name=f"{plate.name or 'plate'}_controls.csv")
+                   file_name=f"{plate_id}_controls.csv")
 d3.download_button("Samples table (.csv)", samp_out.to_csv(index=False),
-                   file_name=f"{plate.name or 'plate'}_samples.csv")
+                   file_name=f"{plate_id}_samples.csv")
 
-# ---- database hook (to fill in once we know your two databases) ----
+# ---- database hook: one destination per hormone (fill in when SQL Server is ready) ----
+# DESTINATIONS = {"P": {"samples": "...", "controls": "..."},
+#                 "E": {...}, "T": {...}, "GC": {...}}
+# dest = DESTINATIONS[hormone]; save(dest["samples"], samp_out); save(dest["controls"], ctrl_out)
 # def save_controls(df): ...   # -> controls database
 # def save_samples(df):  ...   # -> samples database
 # st.button("Send to databases", on_click=lambda: (save_controls(ctrl_out), save_samples(samp_out)))
