@@ -1,25 +1,25 @@
-"""MyAssays -> QC / results web app.  Run with:  streamlit run app.py"""
+"""MyAssays processor.  Run with:  streamlit run app.py"""
 import io
+import altair as alt
+import numpy as np
 import pandas as pd
 import streamlit as st
-from myassays_parser import (parse_myassays, apply_qc,
-                             apply_control_qc, apply_standard_qc, parse_plate_name, HORMONES,
-                             build_sample_output, build_control_output)
+from myassays_parser import (
+    HORMONES, CV_LIMIT, BINDING_RANGE, STD_RECOVERY_RANGE, layout_for,
+    parse_myassays, parse_plate_name, classify, apply_qc, four_pl, curve_checks,
+    build_sample_output, build_control_output, make_control_plate_id)
 
 st.set_page_config(page_title="MyAssays Processor", layout="wide")
-st.title("MyAssays hormone assay processor")
+ICON = {"OK": "🟢 OK", "REVIEW": "🟡 Review", "FAIL": "🔴 Fail"}
 
-# ---- sidebar: QC thresholds (edit once, everyone uses the same defaults) ----
+# =========================== sidebar: inputs ===========================
 with st.sidebar:
-    st.header("QC settings")
-    cv_limit = st.number_input("Duplicate %CV must be below", 1.0, 100.0, 15.5, 0.5)
-    b_lo = st.number_input("Binding (%B/B0) minimum", 0.0, 100.0, 20.0)
-    b_hi = st.number_input("Binding (%B/B0) maximum", 0.0, 100.0, 80.0)
-    rec_lo, rec_hi = 80.0, 120.0  # standard recovery: informational only
+    st.header("Plate")
+    up = st.file_uploader("MyAssays export (.xlsx)", type=["xlsx"])
 
-up = st.file_uploader("Upload the MyAssays export (.xlsx)", type=["xlsx"])
 if not up:
-    st.info("Upload a MyAssays Excel export to begin.")
+    st.title("MyAssays processor")
+    st.info("Upload a MyAssays export in the sidebar to begin.")
     st.stop()
 
 try:
@@ -28,102 +28,183 @@ except Exception as e:
     st.error(f"Couldn't read that file: {e}")
     st.stop()
 
-st.subheader(plate.name or "Unnamed plate")
-if plate.notes:
-    st.caption(f"Notes in file: {plate.notes}")
-
-# ---- plate identifiers (auto-filled from the plate name; edit if wrong) ----
 guess_h, guess_n, guess_date = parse_plate_name(plate.name)
-i1, i2, i3, i4 = st.columns(4)
-hormone = i1.selectbox("Hormone assayed", HORMONES,
-                       index=HORMONES.index(guess_h) if guess_h in HORMONES else 0)
-plate_number = i2.number_input("Plate number", 1, 9999, guess_n or 1, 1)
-date_assayed = i3.date_input("date_assayed", guess_date)
-control_plate_id = i4.text_input("control_plate_id (inter-assay)", "")
-plate_id = f"{hormone}{plate_number}"
-if guess_h and guess_h != hormone:
-    st.warning(f"The file name says '{plate.name}' but you selected hormone {hormone}.")
+fid = up.file_id           # widget keys change with each new upload, so inputs reset
+with st.sidebar:
+    hormone = st.selectbox("Hormone", HORMONES, key=f"h_{fid}",
+                           index=HORMONES.index(guess_h) if guess_h in HORMONES else 0)
+    plate_number = st.number_input("Plate number", 1, 9999, guess_n or 1, 1, key=f"n_{fid}")
+    date_assayed = st.date_input("Date assayed", guess_date, key=f"d_{fid}")
+    plate_id = f"{hormone}{plate_number}"
+    st.caption(f"Plate ID: **{plate_id}**")
+    if guess_h and guess_h != hormone:
+        st.warning(f"File is named '{plate.name}' but hormone {hormone} is selected.")
 
-# ---- plate-level info ----
-c = st.columns(4)
-c[0].metric("R² (4PL)", f"{plate.fit.get('R²', float('nan')):.4f}")
-c[1].metric("MSE", f"{plate.fit.get('MSE', float('nan')):.4f}")
-c[2].metric("B0 raw", f"{plate.b0['raw_1'].iloc[0]:.3f} / {plate.b0['raw_2'].iloc[0]:.3f}"
-            if len(plate.b0) else "n/a")
-c[3].metric("NSB raw", f"{plate.nsb['raw_1'].iloc[0]:.3f} / {plate.nsb['raw_2'].iloc[0]:.3f}"
-            if len(plate.nsb) else "n/a")
+cls = classify(plate, hormone)
+samples_qc = apply_qc(cls.samples)
+controls_qc = apply_qc(cls.controls, check_binding=False)   # controls: CV only
 
-# ---- dilutions (typed by hand; 1 = neat). Final conc = MyAssays conc x factor ----
-st.markdown("### Dilutions")
-st.caption("Enter the dilution factor for each sample (e.g. 128 for 1:128). "
-           "Leave at 1 if neat. See the notes line above for what was run.")
-all_ids = pd.concat([plate.controls["sample"], plate.samples["sample"]], ignore_index=True)
-dil_df = pd.DataFrame({"sample": all_ids, "dilution": 1.0})
-dil_df = st.data_editor(dil_df, hide_index=True, disabled=["sample"], height=250,
-                        column_config={"dilution": st.column_config.NumberColumn(
-                            "Dilution factor (e.g. 128 for 1:128)", min_value=1)})
-dilutions = dict(zip(dil_df["sample"], dil_df["dilution"]))
+st.title(f"{plate_id}  ·  {date_assayed or 'date not set'}")
+if plate.notes:
+    st.info(f"Notes in the file: {plate.notes}")
+if cls.missing_controls:
+    lay = layout_for(hormone)["controls"]
+    st.error("Control wells not found for: " + ", ".join(
+        f"{l} ({'/'.join(lay[l])})" for l in cls.missing_controls) +
+        f". Check that the hormone ({hormone}) is the right one for this file.")
+if cls.stray_controls:
+    st.warning("Rows named like controls but not in the expected control wells (treated "
+               "as samples): " + ", ".join(cls.stray_controls))
 
-controls = apply_control_qc(plate.controls, cv_limit, b_lo, b_hi)
-standards = apply_standard_qc(plate.standards, rec_lo, rec_hi)
-samples = apply_qc(plate.samples, dilutions, cv_limit, b_lo, b_hi)
+tab_s, tab_c, tab_curve = st.tabs(["Samples", "Controls", "Curve"])
 
-# ---- results ----
-cols = ["sample", "wells", "pct_b_b0", "conc_1", "conc_2", "conc_avg", "cv_pct",
-        "sd", "sem", "dilution", "status", "flags"]
-def hl(row):
-    s = row.get("status", "")
-    color = {"FAIL": "#f8c8c8", "REVIEW": "#fff3a3"}.get(s, "")
-    if "status" not in row and row.get("flags"):   # standards table
-        color = "#eeeeee"
-    return [f"background-color: {color}" if color else "" for _ in row]
+# =========================== samples ===========================
+with tab_s:
+    n_fail = int((samples_qc["status"] == "FAIL").sum())
+    n_rev = int((samples_qc["status"] == "REVIEW").sum())
+    n_ok = len(samples_qc) - n_fail - n_rev
+    a, b, c = st.columns(3)
+    a.metric("🟢 OK", n_ok)
+    b.metric(f"🟡 Review (binding outside {BINDING_RANGE[0]:g}-{BINDING_RANGE[1]:g}%)", n_rev)
+    c.metric(f"🔴 Fail (CV ≥ {CV_LIMIT:g}% or replicate problem)", n_fail)
 
-tab1, tab2, tab3 = st.tabs(["Samples", "Controls", "Standards"])
-with tab1:
-    n_fail = int((samples["status"] == "FAIL").sum())
-    n_rev = int((samples["status"] == "REVIEW").sum())
-    st.write(f"{len(samples)} samples: **{n_fail} fail** (red: CV or replicate problem), "
-             f"**{n_rev} to review** (yellow: CV ok, binding outside {b_lo:g}-{b_hi:g}%)")
-    st.dataframe(samples[cols].style.apply(hl, axis=1).format(precision=2),
-                 hide_index=True, use_container_width=True)
-with tab2:
-    st.dataframe(controls[["sample", "wells", "pct_b_b0", "conc_1", "conc_2",
-                           "conc_avg", "cv_pct", "status", "flags"]].style.apply(hl, axis=1),
-                 hide_index=True, use_container_width=True)
-with tab3:
-    st.dataframe(standards[["standard", "nominal", "well", "raw", "backfit",
-                            "recovery_pct", "flags"]].style.apply(hl, axis=1),
-                 hide_index=True, use_container_width=True)
+    bulk = st.number_input("Dilution for all samples (1 = neat, 16 = 1:16)", min_value=1.0,
+                           value=1.0, step=1.0, key=f"bulk_{fid}")
+    s_in = pd.DataFrame({
+        "Result": samples_qc["status"].map(ICON), "Sample": samples_qc["sample"],
+        "Wells": samples_qc["wells"], "Binding %": samples_qc["pct_b_b0"],
+        "Conc 1": samples_qc["conc_1"], "Conc 2": samples_qc["conc_2"],
+        "Conc avg": samples_qc["conc_avg"], "CV %": samples_qc["cv_pct"],
+        "Dilution": bulk, "Notes": samples_qc["flags"]})
+    st.caption("The box above fills the whole Dilution column. To change one sample, "
+               "type over its value in the table. Everything else is read-only.")
+    s_ed = st.data_editor(
+        s_in, hide_index=True, key=f"samples_{fid}", width="stretch",
+        disabled=[c for c in s_in.columns if c != "Dilution"],
+        height=min(36 * (len(s_in) + 1) + 3, 720),
+        column_config={
+            "Binding %": st.column_config.NumberColumn(format="%.1f"),
+            "CV %": st.column_config.NumberColumn(format="%.1f"),
+            "Conc 1": st.column_config.NumberColumn(format="%g"),
+            "Conc 2": st.column_config.NumberColumn(format="%g"),
+            "Conc avg": st.column_config.NumberColumn(format="%g"),
+            "Dilution": st.column_config.NumberColumn(min_value=1.0, step=1.0, format="%g")})
 
-# ---- downloads ----
-st.markdown("### Export")
-st.caption("conc_1, conc_2 and conc_avg are the raw MyAssays values, not multiplied by dilution. "
-           "Final concentrations are calculated later. flag is blank when a sample is OK.")
-if not date_assayed:
-    st.warning("Fill in date_assayed before exporting.")
-samp_out = build_sample_output(samples, hormone, plate_number, date_assayed)
-ctrl_out = build_control_output(plate.controls, dilutions, hormone, plate_number,
-                                date_assayed, control_plate_id or None)
-with st.expander("Preview export tables"):
-    st.write("Samples file"); st.dataframe(samp_out, hide_index=True)
-    st.write("Controls file"); st.dataframe(ctrl_out, hide_index=True)
+# =========================== controls ===========================
+with tab_c:
+    if controls_qc.empty:
+        st.warning("No controls found for this hormone's layout.")
+        c_ed = pd.DataFrame({"Control ID": [], "Dilution": []})
+    else:
+        st.caption(f"Controls are checked for CV < {CV_LIMIT:g}% only (no binding rule). "
+                   "Type the ID of each control, e.g. the pool or lot name; it is combined "
+                   "with the plate ID to make control_plate_id.")
+        c_in = pd.DataFrame({
+            "Keep": True, "Level": controls_qc["control_level"], "Control ID": "",
+            "Result": controls_qc["status"].map(ICON), "Wells": controls_qc["wells"],
+            "Binding %": controls_qc["pct_b_b0"], "Conc 1": controls_qc["conc_1"],
+            "Conc 2": controls_qc["conc_2"], "Conc avg": controls_qc["conc_avg"],
+            "CV %": controls_qc["cv_pct"], "Dilution": 1.0, "Notes": controls_qc["flags"]})
+        c_ed = st.data_editor(
+            c_in, hide_index=True, key=f"controls_{fid}", width="stretch",
+            disabled=[c for c in c_in.columns if c not in ("Keep", "Control ID", "Dilution")],
+            column_config={
+                "Keep": st.column_config.CheckboxColumn(
+                    "Export?", help="Untick to leave a bad control out of the export."),
+                "Control ID": st.column_config.TextColumn(
+                    help="e.g. the pool/lot name. Same name across plates = same control."),
+                "Binding %": st.column_config.NumberColumn(format="%.1f"),
+                "CV %": st.column_config.NumberColumn(format="%.1f"),
+                "Conc 1": st.column_config.NumberColumn(format="%g"),
+                "Conc 2": st.column_config.NumberColumn(format="%g"),
+                "Conc avg": st.column_config.NumberColumn(format="%g"),
+                "Dilution": st.column_config.NumberColumn(min_value=1.0, step=1.0, format="%g")})
+        kept = c_ed[c_ed["Keep"].fillna(False)]
+        ids = kept["Control ID"].fillna("").tolist()
+        if len(kept) < len(c_ed):
+            st.caption(f"{len(c_ed) - len(kept)} control(s) will be left out of the export.")
+        if any(not i.strip() for i in ids):
+            st.warning("Enter an ID for every control you are keeping before exporting.")
+        else:
+            st.write("control_plate_id:  " + "   ·   ".join(
+                f"**{l}** → `{make_control_plate_id(plate_id, i)}`"
+                for l, i in zip(kept["Level"], ids)))
+        st.caption("Later: a Levey-Jennings view of each control across all plates "
+                   "in the database, plus the running inter-assay CV.")
 
-buf = io.BytesIO()
-with pd.ExcelWriter(buf, engine="openpyxl") as xw:
-    samp_out.to_excel(xw, sheet_name="Samples", index=False)
-    ctrl_out.to_excel(xw, sheet_name="Controls", index=False)
-d1, d2, d3 = st.columns(3)
-d1.download_button("Download results (.xlsx)", buf.getvalue(),
-                   file_name=f"{plate_id}_results.xlsx")
-d2.download_button("Controls table (.csv)", ctrl_out.to_csv(index=False),
-                   file_name=f"{plate_id}_controls.csv")
-d3.download_button("Samples table (.csv)", samp_out.to_csv(index=False),
-                   file_name=f"{plate_id}_samples.csv")
+# =========================== curve ===========================
+with tab_curve:
+    checks, curve_ok = curve_checks(plate, cls.b0, cls.nsb)
+    (st.success if curve_ok else st.error)(
+        "Curve looks good" if curve_ok else "Check this curve before trusting the results")
+    for name, passed, detail in checks:
+        icon = "ℹ️" if passed is None else ("✅" if passed else "❌")
+        st.write(f"{icon} **{name}**: {detail}")
 
-# ---- database hook: one destination per hormone (fill in when SQL Server is ready) ----
-# DESTINATIONS = {"P": {"samples": "...", "controls": "..."},
-#                 "E": {...}, "T": {...}, "GC": {...}}
+    f = plate.fit
+    std = plate.standards.drop_duplicates("standard")
+    if len(std) and all(k in f for k in "abcd"):
+        xs = np.geomspace(std["nominal"].min() * 0.5, std["nominal"].max() * 1.5, 150)
+        line = pd.DataFrame({"conc": xs, "binding": four_pl(xs, f["a"], f["b"], f["c"], f["d"])})
+        pts = pd.concat([
+            pd.DataFrame({"conc": std["nominal"], "binding": std["raw_avg"], "Series": "Standards"}),
+            samples_qc.dropna(subset=["conc_avg", "pct_b_b0"]).query("conc_avg > 0")
+            .rename(columns={"conc_avg": "conc", "pct_b_b0": "binding"})[["conc", "binding"]]
+            .assign(Series="Samples")])
+        x = alt.X("conc:Q", scale=alt.Scale(type="log"), title="Concentration (MyAssays units)")
+        y = alt.Y("binding:Q", title="% binding (B/B0)")
+        chart = (
+            alt.Chart(line).mark_line(color="#888").encode(x=x, y=y)
+            + alt.Chart(pts).mark_circle(opacity=0.8).encode(
+                x=x, y=y, size=alt.Size("Series:N", scale=alt.Scale(
+                    domain=["Standards", "Samples"], range=[130, 40]), legend=None),
+                color=alt.Color("Series:N", scale=alt.Scale(
+                    domain=["Standards", "Samples"], range=["#1f77b4", "#ff7f0e"])),
+                tooltip=["Series", "conc", "binding"])
+            + alt.Chart(pd.DataFrame({"y": list(BINDING_RANGE)})).mark_rule(
+                strokeDash=[4, 4], color="#bbb").encode(y="y:Q")
+        ).properties(height=380)
+        st.altair_chart(chart, width="stretch")
+        st.caption("Grey line: fitted 4PL curve. Dashed lines: the "
+                   f"{BINDING_RANGE[0]:g}-{BINDING_RANGE[1]:g}% working window.")
+    with st.expander("Fit parameters and standards"):
+        st.write({k: v for k, v in f.items()})
+        st.dataframe(plate.standards[["standard", "nominal", "well", "raw", "backfit",
+                                      "recovery_pct"]], hide_index=True)
+
+# =========================== sidebar: export ===========================
+dil_s = s_ed["Dilution"].fillna(1.0).values
+samp_out = build_sample_output(samples_qc, dil_s, hormone, plate_number, date_assayed)
+if controls_qc.empty:
+    ctrl_out = pd.DataFrame()
+else:
+    ctrl_out = build_control_output(
+        controls_qc, c_ed["Control ID"].fillna("").tolist(),
+        c_ed["Dilution"].fillna(1.0).values, hormone, plate_number, date_assayed)
+    ctrl_out = ctrl_out[c_ed["Keep"].fillna(False).values].reset_index(drop=True)
+
+with st.sidebar:
+    st.divider()
+    st.header("Export")
+    problems = []
+    if not date_assayed:
+        problems.append("date assayed")
+    if not ctrl_out.empty and (ctrl_out["control_id"] == "").any():
+        problems.append("control IDs")
+    if problems:
+        st.warning("Still needed: " + ", ".join(problems))
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as xw:
+        samp_out.to_excel(xw, sheet_name="Samples", index=False)
+        ctrl_out.to_excel(xw, sheet_name="Controls", index=False)
+    st.download_button("Samples (.csv)", samp_out.to_csv(index=False),
+                       f"{plate_id}_samples.csv", width="stretch")
+    st.download_button("Controls (.csv)", ctrl_out.to_csv(index=False),
+                       f"{plate_id}_controls.csv", width="stretch")
+    st.download_button("Both (.xlsx)", buf.getvalue(), f"{plate_id}_results.xlsx",
+                       width="stretch")
+    st.caption("conc values are raw MyAssays values, not multiplied by dilution.")
+
+# Database hook, one destination per hormone (fill in when SQL Server is ready):
+# DESTINATIONS = {"P": {"samples": "...", "controls": "..."}, "E": {...}, "T": {...}, "GC": {...}}
 # dest = DESTINATIONS[hormone]; save(dest["samples"], samp_out); save(dest["controls"], ctrl_out)
-# def save_controls(df): ...   # -> controls database
-# def save_samples(df):  ...   # -> samples database
-# st.button("Send to databases", on_click=lambda: (save_controls(ctrl_out), save_samples(samp_out)))
