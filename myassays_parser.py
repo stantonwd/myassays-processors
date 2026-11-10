@@ -1,6 +1,6 @@
 """Parse a MyAssays Desktop Excel export into tidy pandas tables.
 
-Layout it expects (matches the P15 export):
+Layout it expects:
   A1            plate / run name
   A2            free-text notes (dilutions, reruns, ...)
   J:K rows 3-12 4PL fit parameters (a, b, c, d, MSE, R2, SS, SYX)
@@ -202,7 +202,6 @@ def apply_qc(samples: pd.DataFrame, dilutions: dict, cv_limit: float = 15.5,
     d["mean_conc"] = reps.mean(axis=1)
     d["sd_calc"] = reps.std(axis=1, ddof=1)
     d["cv_calc"] = d["sd_calc"] / d["mean_conc"] * 100
-    d["final_conc"] = d["conc_avg"].fillna(d["mean_conc"]) * d["dilution"]
     return pd.concat([d, d.apply(_qc_flags, axis=1, args=(cv_limit, b_lo, b_hi))], axis=1)
 
 
@@ -221,3 +220,55 @@ def apply_standard_qc(standards: pd.DataFrame, lo=80.0, hi=120.0) -> pd.DataFram
     d["flags"] = np.where((d["recovery_pct"] < lo) | (d["recovery_pct"] > hi),
                           f"Recovery outside {lo:g}-{hi:g}% (info)", "")
     return d
+
+
+# ---------------------------------------------------------------------------
+# Output tables (the columns that go to the databases)
+# ---------------------------------------------------------------------------
+import datetime as _dt
+
+HORMONES = ["P", "E", "T", "GC"]   # code used in plate names, e.g. P15 = 15th P plate
+
+
+def parse_plate_name(name: str):
+    """'P15 06NOV2026' -> ('P', 15, date(2026, 11, 6)). Any part may be None."""
+    hormone, number, date = None, None, None
+    name = name or ""
+    m = re.search(r"(\d{1,2}[A-Za-z]{3}\d{4})", name)
+    if m:
+        try:
+            date = _dt.datetime.strptime(m.group(1).upper(), "%d%b%Y").date()
+        except ValueError:
+            pass
+    m = re.match(r"\s*([A-Za-z]+)\s*(\d+)", name)
+    if m:
+        hormone, number = m.group(1).upper(), int(m.group(2))
+    return hormone, number, date
+
+
+def _combine_flag(df: pd.DataFrame) -> pd.Series:
+    """One text column: '' if OK, otherwise 'FAIL: ...' or 'REVIEW: ...'."""
+    return np.where(df["status"].eq("OK"), "", df["status"] + ": " + df["flags"])
+
+
+def build_sample_output(samples_qc: pd.DataFrame, hormone, plate_number, date_assayed) -> pd.DataFrame:
+    """One row per sample per plate. conc_* are the raw values from MyAssays
+    (NOT multiplied by dilution); final concentrations are calculated later."""
+    d = samples_qc
+    return pd.DataFrame({
+        "sample_id": d["sample"], "hormone": hormone,
+        "plate_id": f"{hormone}{plate_number}", "plate_number": plate_number,
+        "date_assayed": date_assayed, "binding_pct": d["pct_b_b0"],
+        "conc_1": d["conc_1"], "conc_2": d["conc_2"], "conc_avg": d["conc_avg"],
+        "dilution": d["dilution"], "flag": _combine_flag(d)})
+
+
+def build_control_output(controls: pd.DataFrame, dilutions: dict, hormone, plate_number,
+                         date_assayed, control_plate_id) -> pd.DataFrame:
+    d = controls
+    return pd.DataFrame({
+        "control_id": d["sample"], "hormone": hormone,
+        "plate_id": f"{hormone}{plate_number}", "plate_number": plate_number,
+        "control_plate_id": control_plate_id, "date_assayed": date_assayed,
+        "binding_pct": d["pct_b_b0"], "conc_1": d["conc_1"], "conc_2": d["conc_2"],
+        "conc_avg": d["conc_avg"], "dilution": d["sample"].map(dilutions).fillna(1.0).values})
