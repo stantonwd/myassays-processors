@@ -7,7 +7,8 @@ import streamlit as st
 from myassays_parser import (
     HORMONES, CV_LIMIT, BINDING_RANGE, STD_RECOVERY_RANGE, layout_for,
     parse_myassays, parse_plate_name, classify, apply_qc, four_pl, curve_checks,
-    build_sample_output, build_control_output, make_control_plate_id)
+    build_sample_output, build_control_output, make_control_plate_id,
+    apply_control_expectations, plate_verdict, duplicate_runs, CONTROL_TOLERANCE)
 
 st.set_page_config(page_title="MyAssays Processor", layout="wide")
 ICON = {"OK": "🟢 OK", "REVIEW": "🟡 Review", "FAIL": "🔴 Fail"}
@@ -42,9 +43,18 @@ with st.sidebar:
 
 cls = classify(plate, hormone)
 samples_qc = apply_qc(cls.samples)
-controls_qc = apply_qc(cls.controls, check_binding=False)   # controls: CV only
+controls_qc = apply_control_expectations(           # controls: CV + expected binding,
+    apply_qc(cls.controls, check_binding=False))    # not the 20-80% window
+checks, curve_ok = curve_checks(plate, cls.b0, cls.nsb)
+rerun_reasons = plate_verdict(checks, controls_qc, cls.missing_controls)
 
 st.title(f"{plate_id}  ·  {date_assayed or 'date not set'}")
+if rerun_reasons:
+    st.warning("**Consider rerunning this plate**\n\n" +
+               "\n".join(f"- {r}" for r in rerun_reasons))
+else:
+    st.success("**Plate check:** controls are near their expected binding and the "
+               "curve has a straight working range.")
 if plate.notes:
     st.info(f"Notes in the file: {plate.notes}")
 if cls.missing_controls:
@@ -96,13 +106,15 @@ with tab_c:
         st.warning("No controls found for this hormone's layout.")
         c_ed = pd.DataFrame({"Control ID": [], "Dilution": []})
     else:
-        st.caption(f"Controls are checked for CV < {CV_LIMIT:g}% only (no binding rule). "
+        st.caption(f"Controls are checked for CV < {CV_LIMIT:g}% and for binding within "
+                   f"±{CONTROL_TOLERANCE:g} points of the expected level (no 20-80% rule). "
                    "Type the ID of each control, e.g. the pool or lot name; it is combined "
                    "with the plate ID to make control_plate_id.")
         c_in = pd.DataFrame({
             "Keep": True, "Level": controls_qc["control_level"], "Control ID": "",
             "Result": controls_qc["status"].map(ICON), "Wells": controls_qc["wells"],
-            "Binding %": controls_qc["pct_b_b0"], "Conc 1": controls_qc["conc_1"],
+            "Binding %": controls_qc["pct_b_b0"], "Expected %": controls_qc["expected_pct"],
+            "Conc 1": controls_qc["conc_1"],
             "Conc 2": controls_qc["conc_2"], "Conc avg": controls_qc["conc_avg"],
             "CV %": controls_qc["cv_pct"], "Dilution": 1.0, "Notes": controls_qc["flags"]})
         c_ed = st.data_editor(
@@ -114,6 +126,7 @@ with tab_c:
                 "Control ID": st.column_config.TextColumn(
                     help="e.g. the pool/lot name. Same name across plates = same control."),
                 "Binding %": st.column_config.NumberColumn(format="%.1f"),
+                "Expected %": st.column_config.NumberColumn(format="~%g"),
                 "CV %": st.column_config.NumberColumn(format="%.1f"),
                 "Conc 1": st.column_config.NumberColumn(format="%g"),
                 "Conc 2": st.column_config.NumberColumn(format="%g"),
@@ -134,7 +147,6 @@ with tab_c:
 
 # =========================== curve ===========================
 with tab_curve:
-    checks, curve_ok = curve_checks(plate, cls.b0, cls.nsb)
     (st.success if curve_ok else st.error)(
         "Curve looks good" if curve_ok else "Check this curve before trusting the results")
     for name, passed, detail in checks:
@@ -193,6 +205,11 @@ with st.sidebar:
         problems.append("control IDs")
     if problems:
         st.warning("Still needed: " + ", ".join(problems))
+    dups = duplicate_runs(samp_out)
+    if dups:
+        st.warning("Same sample ID more than once at the same dilution: " +
+                   ", ".join(dups) + ". Likely a typo or a missing dilution; check "
+                   "before exporting.")
     buf = io.BytesIO()
     with pd.ExcelWriter(buf, engine="openpyxl") as xw:
         samp_out.to_excel(xw, sheet_name="Samples", index=False)

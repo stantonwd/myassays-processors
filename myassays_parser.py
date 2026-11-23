@@ -36,8 +36,16 @@ LAYOUTS = {
 }
 LEVEL_ORDER = ["hi", "mid", "low"]
 
+# Controls: expected %B/B0 per level (loose). A control further than
+# CONTROL_TOLERANCE points from its expected binding is a reason to rerun.
+CONTROL_EXPECTED_BINDING = {"hi": 30.0, "mid": 50.0, "low": 70.0}
+CONTROL_TOLERANCE = 15.0
+
 # Curve diagnostic thresholds (suggested starting points; edit freely)
 CURVE_R2_MIN = 0.99
+LINEAR_MIN_STANDARDS = 3                # standards needed inside BINDING_RANGE
+LINEAR_R2_MIN = 0.97                    # binding vs log(conc), standards in window
+CURVATURE_MAX = 5.0                     # max points the fit bends away from a line in window
 STD_RECOVERY_RANGE = (80.0, 120.0)      # informational only
 
 
@@ -226,6 +234,31 @@ def apply_qc(df: pd.DataFrame, check_binding: bool = True) -> pd.DataFrame:
     return pd.concat([df, df.apply(_qc_row, axis=1, args=(check_binding,))], axis=1)
 
 
+def apply_control_expectations(controls_qc: pd.DataFrame) -> pd.DataFrame:
+    """Compare each control's binding with its expected level. A control more
+    than CONTROL_TOLERANCE points off becomes REVIEW (unless already FAIL)."""
+    d = controls_qc.copy()
+    if d.empty:
+        return d.assign(expected_pct=[], off_expected=[])
+    d["expected_pct"] = d["control_level"].map(CONTROL_EXPECTED_BINDING)
+    dev = d["pct_b_b0"] - d["expected_pct"]
+    d["off_expected"] = dev.abs() > CONTROL_TOLERANCE
+    for i in d.index[d["off_expected"]]:
+        msg = (f"Binding {d.at[i, 'pct_b_b0']:.1f}% vs expected ~"
+               f"{d.at[i, 'expected_pct']:g}% (±{CONTROL_TOLERANCE:g})")
+        d.at[i, "flags"] = "; ".join(f for f in (d.at[i, "flags"], msg) if f)
+        if d.at[i, "status"] == "OK":
+            d.at[i, "status"] = "REVIEW"
+    return d
+
+
+def duplicate_runs(sample_out: pd.DataFrame) -> list:
+    """Sample IDs that appear more than once on this plate at the same dilution.
+    (sample_id + hormone + plate_id + dilution is the run key downstream.)"""
+    dup = sample_out.duplicated(["sample_id", "dilution"], keep=False)
+    return sorted(sample_out.loc[dup, "sample_id"].astype(str).unique())
+
+
 # ---------------------------------------------------------------------------
 # Curve diagnostics
 # ---------------------------------------------------------------------------
@@ -252,6 +285,40 @@ def curve_checks(plate: Plate, b0: pd.DataFrame, nsb: pd.DataFrame):
         checks.append((f"Standards bracket the {lo:g}-{hi:g}% working range", span,
                        f"standards run from {bottom:.1f}% to {top:.1f}% binding"))
 
+        # Linear portion: standards inside the window should fall on a straight
+        # line against log concentration.
+        inwin = std[std["raw_avg"].between(lo, hi) & (std["nominal"] > 0)]
+        n_in = len(inwin)
+        checks.append((f"At least {LINEAR_MIN_STANDARDS} standards inside {lo:g}-{hi:g}%",
+                       n_in >= LINEAR_MIN_STANDARDS, f"{n_in} standard(s) in the window"))
+        if n_in >= LINEAR_MIN_STANDARDS:
+            lx, y = np.log10(inwin["nominal"].values), inwin["raw_avg"].values
+            r = np.corrcoef(lx, y)[0, 1]
+            r2l = r * r if np.isfinite(r) else 0.0
+            checks.append((f"Standards in the window are linear on log scale",
+                           bool(r2l >= LINEAR_R2_MIN),
+                           f"R² {r2l:.3f} (want ≥ {LINEAR_R2_MIN})"))
+
+    f = plate.fit
+    if all(k in f and np.isfinite(f[k]) for k in "abcd"):
+        x_hi, x_lo = inverse_four_pl(BINDING_RANGE[1], **{k: f[k] for k in "abcd"}), \
+                     inverse_four_pl(BINDING_RANGE[0], **{k: f[k] for k in "abcd"})
+        if np.isfinite(x_hi) and np.isfinite(x_lo) and x_hi > 0 and x_lo > 0:
+            xs = np.geomspace(min(x_hi, x_lo), max(x_hi, x_lo), 200)
+            fit_y = four_pl(xs, f["a"], f["b"], f["c"], f["d"])
+            line = np.interp(np.log10(xs), np.log10([xs[0], xs[-1]]), [fit_y[0], fit_y[-1]])
+            bend = float(np.max(np.abs(fit_y - line)))
+            checks.append((f"Fitted curve is straight across {BINDING_RANGE[0]:g}-"
+                           f"{BINDING_RANGE[1]:g}%", bool(bend <= CURVATURE_MAX),
+                           f"bends up to {bend:.1f} points from a line (want ≤ {CURVATURE_MAX:g})"))
+            checks.append(("Quantifiable range (info only)", None,
+                           f"{min(x_hi, x_lo):,.4g} to {max(x_hi, x_lo):,.4g} "
+                           f"({max(x_hi, x_lo) / min(x_hi, x_lo):.0f}-fold)"))
+        else:
+            checks.append((f"Fitted curve crosses {BINDING_RANGE[0]:g}% and "
+                           f"{BINDING_RANGE[1]:g}% binding", False,
+                           "the fit never reaches one end of the working window"))
+
     rec = plate.standards["recovery_pct"].dropna()
     if len(rec):
         ok = rec.between(*STD_RECOVERY_RANGE)
@@ -265,6 +332,28 @@ def curve_checks(plate: Plate, b0: pd.DataFrame, nsb: pd.DataFrame):
                            f"{nsbm / b0m * 100:.1f}%  (B0 {b0m:.3f}, NSB {nsbm:.3f})"))
     overall = all(c[1] for c in checks if c[1] is not None)
     return checks, overall
+
+
+def inverse_four_pl(y, a, b, c, d):
+    """Concentration giving binding y on the 4PL; NaN if y is outside the curve."""
+    a, b, c, d, y = (np.float64(v) for v in (a, b, c, d, y))
+    with np.errstate(all="ignore"):
+        ratio = (a - d) / (y - d) - 1
+        return float(c * ratio ** (1 / b)) if np.isfinite(ratio) and ratio > 0 else np.nan
+
+
+def plate_verdict(checks, controls_qc: pd.DataFrame, missing_controls: list) -> list:
+    """Plain-language reasons to consider rerunning the plate (empty = plate OK).
+    Uses your two rerun criteria: controls way off, or a bad curve shape."""
+    reasons = [f"Curve: {name} ({detail})" for name, passed, detail in checks
+               if passed is False]
+    if missing_controls:
+        reasons.append("Controls not found: " + ", ".join(missing_controls))
+    if not controls_qc.empty and "off_expected" in controls_qc:
+        for _, r in controls_qc[controls_qc["off_expected"]].iterrows():
+            reasons.append(f"{r['control_level']} control binds {r['pct_b_b0']:.0f}% "
+                           f"(expected ~{r['expected_pct']:g}%)")
+    return reasons
 
 
 # ---------------------------------------------------------------------------
