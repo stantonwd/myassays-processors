@@ -220,17 +220,20 @@ def _qc_row(r, check_binding: bool):
         fail.append("Only 1 valid replicate")
     elif r["cv_pct"] >= CV_LIMIT:
         fail.append(f"CV {r['cv_pct']:.1f}% (limit < {CV_LIMIT:g}%)")
-    if check_binding and pd.notna(r["pct_b_b0"]) and \
-            not (BINDING_RANGE[0] <= r["pct_b_b0"] <= BINDING_RANGE[1]):
+    binding_ok = not (check_binding and pd.notna(r["pct_b_b0"]) and
+                      not (BINDING_RANGE[0] <= r["pct_b_b0"] <= BINDING_RANGE[1]))
+    if not binding_ok:
         review.append(f"Binding {r['pct_b_b0']:.1f}% outside "
                       f"{BINDING_RANGE[0]:g}-{BINDING_RANGE[1]:g}%")
     status = "FAIL" if fail else ("REVIEW" if review else "OK")
-    return pd.Series({"status": status, "flags": "; ".join(fail + review)})
+    # n_valid / binding_ok are kept for the rerun rules (records.py)
+    return pd.Series({"status": status, "flags": "; ".join(fail + review),
+                      "n_valid": n_valid, "binding_ok": binding_ok})
 
 
 def apply_qc(df: pd.DataFrame, check_binding: bool = True) -> pd.DataFrame:
     if df.empty:
-        return df.assign(status=[], flags=[])
+        return df.assign(status=[], flags=[], n_valid=[], binding_ok=[])
     return pd.concat([df, df.apply(_qc_row, axis=1, args=(check_binding,))], axis=1)
 
 
