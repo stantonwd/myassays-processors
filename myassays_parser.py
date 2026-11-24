@@ -153,14 +153,22 @@ def parse_myassays(file) -> Plate:
     return Plate(name, notes, fit, standards, pd.DataFrame(rows))
 
 
+# English and Spanish month abbreviations (plate names use both, e.g. 04AGO2026)
+_MONTHS = {m: i + 1 for i, m in enumerate(
+    ["JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP", "OCT", "NOV", "DEC"])}
+_MONTHS.update({"ENE": 1, "ABR": 4, "AGO": 8, "SET": 9, "DIC": 12})
+
+
 def parse_plate_name(name: str):
-    """'P15 06NOV2026' -> ('P', 15, date(2026, 11, 6)). Any part may be None."""
+    """'P15 06NOV2026' -> ('P', 15, date(2026, 11, 6)). Also '04AGO2026' and
+    '17Jul26'. Any part may be None."""
     hormone = number = date = None
     name = name or ""
-    m = re.search(r"(\d{1,2}[A-Za-z]{3}\d{4})", name)
-    if m:
+    m = re.search(r"(\d{1,2})([A-Za-z]{3})(\d{4}|\d{2})(?!\d)", name)
+    if m and m.group(2).upper() in _MONTHS:
+        year = int(m.group(3)) + (2000 if len(m.group(3)) == 2 else 0)
         try:
-            date = _dt.datetime.strptime(m.group(1).upper(), "%d%b%Y").date()
+            date = _dt.date(year, _MONTHS[m.group(2).upper()], int(m.group(1)))
         except ValueError:
             pass
     m = re.match(r"\s*([A-Za-z]+)\s*(\d+)", name)
