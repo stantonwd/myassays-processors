@@ -3,6 +3,11 @@ Extract data on recovery curves, controls, and sample binding from MyAssays .xls
 
 ## Run
 
+On Windows, double-click `run_app.bat`. The first time, it creates a `.venv` with
+the required packages; after that it just starts the app in your browser.
+
+Or by hand:
+
 ```
 pip install -r requirements.txt
 streamlit run app.py

@@ -1,5 +1,6 @@
 """MyAssays processor.  Run with:  streamlit run app.py"""
 import io
+import os
 import altair as alt
 import numpy as np
 import pandas as pd
@@ -17,9 +18,20 @@ SERIES, MUTED = "#2a78d6", "#898781"     # Levey-Jennings: one series + referenc
 
 
 def _secret(key):
+    """st.secrets only looks in the folder streamlit was started from, so also
+    read .streamlit/secrets.toml next to this file directly."""
     try:
-        return st.secrets.get(key)
-    except Exception:            # no secrets.toml on this machine
+        val = st.secrets.get(key)
+        if val:
+            return val
+    except Exception:            # no secrets.toml where streamlit looked
+        pass
+    try:
+        import tomllib
+        from pathlib import Path
+        with open(Path(__file__).parent / ".streamlit" / "secrets.toml", "rb") as fh:
+            return tomllib.load(fh).get(key)
+    except Exception:
         return None
 
 
@@ -72,6 +84,9 @@ if coll_file:
         st.sidebar.warning(f"Couldn't read {coll_file.name}: {e}")
 with st.sidebar:
     st.caption(f"Data folder: `{DATA_DIR}`")
+    if not _secret("data_dir") and not os.environ.get("MYASSAYS_DATA_DIR"):
+        st.warning("No data folder is set, so the default above is being used. Set "
+                   "data_dir in .streamlit/secrets.toml (see README).")
     if coll_file:
         st.caption(f"Collection file: `{coll_file.name}`")
     else:
@@ -160,7 +175,7 @@ with tab_c:
         last = rec.last_lots(db["controls"], hormone)
         c_in = pd.DataFrame({
             "Keep": controls_qc["status"].ne("FAIL"), "Level": controls_qc["control_level"],
-            "Control ID": controls_qc["control_level"].map(last).fillna(""),
+            "Control ID": controls_qc["control_level"].map(lambda l: last.get(l, "")),
             "Result": controls_qc["status"].map(ICON), "Wells": controls_qc["wells"],
             "Binding %": controls_qc["pct_b_b0"], "Expected %": controls_qc["expected_pct"],
             "Conc 1": controls_qc["conc_1"],
